@@ -553,6 +553,10 @@ function wrapScriptCode(script) {
   const gmSlackUserIdCode = hasSlackUserIdGrant
     ? `
   const ensureGMSlackUserId = () => {
+    if (typeof globalThis.GM_slackUserId === "function") {
+      return;
+    }
+
     const SLACK_CHANNEL = "openTamper:gmSlackUserId";
     const SCRIPT_ID = ${JSON.stringify(script.id)};
     const TIMEOUT_MS = 30000;
@@ -1356,6 +1360,8 @@ async function handleSlackUserId(message, sender, sendResponse) {
       }
     } catch (error) {
       console.warn("[OpenTamper] Failed to validate slackUserId grant", error);
+      sendResponse?.({ error: true, errorMessage: "Failed to validate grant: " + (error.message || String(error)) });
+      return;
     }
   }
 
@@ -1367,24 +1373,40 @@ async function handleSlackUserId(message, sender, sendResponse) {
     let createdTabId = null;
 
     if (!tabs || tabs.length === 0) {
+      // No Slack tab open — create a background tab to read IndexedDB, then close it.
+      // The tab is non-active so it won't steal focus.
       const tab = await chrome.tabs.create({ url: "https://app.slack.com/", active: false });
       createdTabId = tab.id;
+      let onUpdated;
       await Promise.race([
         new Promise((resolve) => {
-          const listener = (tabId, info) => {
+          onUpdated = (tabId, info) => {
             if (tabId === createdTabId && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
+              chrome.tabs.onUpdated.removeListener(onUpdated);
+              onUpdated = null;
               resolve();
             }
           };
-          chrome.tabs.onUpdated.addListener(listener);
+          chrome.tabs.onUpdated.addListener(onUpdated);
         }),
-        new Promise((resolve) => setTimeout(resolve, TAB_LOAD_TIMEOUT_MS)),
+        new Promise((resolve) => setTimeout(() => {
+          if (onUpdated) {
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            onUpdated = null;
+          }
+          console.warn("[OpenTamper] Slack tab load timed out after " + TAB_LOAD_TIMEOUT_MS + "ms, proceeding anyway");
+          resolve();
+        }, TAB_LOAD_TIMEOUT_MS)),
       ]);
       tabs = [tab];
     }
 
     const tabId = tabs[0].id;
+    // Slack stores Redux state in IndexedDB "reduxPersistence" / "reduxPersistenceStore"
+    // with keys like "persist:slack-client-<orgId>-<userId>". This is an internal
+    // implementation detail (no stable Slack API exposes "which user am I?" without
+    // Admin-level tokens). If Slack changes this schema, this code will need updating.
+    // Last verified: March 2026.
     const keyPrefix = `persist:slack-client-${org}-`;
 
     let results;

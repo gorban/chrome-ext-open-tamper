@@ -11,8 +11,7 @@ function relayToBackground(channel, event) {
 
   if (type !== "request") return;
 
-  const msgType = channel;
-  const payload = { type: msgType, id, scriptId };
+  const payload = { type: channel, id, scriptId };
 
   if (channel === XHR_CHANNEL) {
     payload.details = event.data.details;
