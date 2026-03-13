@@ -385,11 +385,14 @@ function wrapScriptCode(script) {
     ? `      if (!globalThis[REQUIRE_FLAG]) {\n${indentedRequires}        globalThis[REQUIRE_FLAG] = true;\n      }\n`
     : "";
 
-  // Check if script has GM_xmlhttpRequest grant
   const grants = Array.isArray(script.grants) ? script.grants : [];
+
   const hasXhrGrant =
     grants.includes("GM_xmlhttpRequest") ||
     grants.includes("GM.xmlHttpRequest");
+
+  const hasSlackUserIdGrant =
+    grants.includes("GM_slackUserId");
 
   // GM_xmlhttpRequest implementation injected when granted
   const gmXhrCode = hasXhrGrant
@@ -547,7 +550,66 @@ function wrapScriptCode(script) {
 `
     : "";
 
+  const gmSlackUserIdCode = hasSlackUserIdGrant
+    ? `
+  const ensureGMSlackUserId = () => {
+    if (typeof globalThis.GM_slackUserId === "function") {
+      return;
+    }
+
+    const SLACK_CHANNEL = "openTamper:slackUserId";
+    const SCRIPT_ID = ${JSON.stringify(script.id)};
+    const pendingRequests = new Map();
+    let requestIdCounter = 0;
+
+    window.addEventListener("message", (event) => {
+      if (event.source !== window) return;
+      if (!event.data || event.data.channel !== SLACK_CHANNEL) return;
+
+      const { id, type, response, error } = event.data;
+      const pending = pendingRequests.get(id);
+      if (!pending) return;
+      pendingRequests.delete(id);
+
+      if (type === "response") {
+        if (response.error) {
+          pending.reject(new Error(response.errorMessage));
+        } else {
+          pending.resolve(response.userId);
+        }
+      } else if (type === "error") {
+        pending.reject(new Error(error));
+      }
+    });
+
+    const slackUserId = (org) => {
+      if (!org || typeof org !== "string") {
+        return Promise.reject(new Error("GM_slackUserId requires an org string"));
+      }
+      return new Promise((resolve, reject) => {
+        const requestId = SCRIPT_ID + "_slack_" + (++requestIdCounter);
+        pendingRequests.set(requestId, { resolve, reject });
+        window.postMessage({
+          channel: SLACK_CHANNEL,
+          id: requestId,
+          type: "request",
+          scriptId: SCRIPT_ID,
+          org,
+        }, "*");
+      });
+    };
+
+    Object.defineProperty(globalThis, "GM_slackUserId", {
+      value: slackUserId,
+      configurable: true,
+      writable: true,
+    });
+  };
+`
+    : "";
+
   const ensureXhrCall = hasXhrGrant ? "      ensureGMXmlHttpRequest();\n" : "";
+  const ensureSlackUserIdCall = hasSlackUserIdGrant ? "      ensureGMSlackUserId();\n" : "";
 
   return `(() => {
   const EVENT_NAME = ${JSON.stringify(eventName)};
@@ -590,7 +652,7 @@ function wrapScriptCode(script) {
       writable: true
     });
   };
-${gmXhrCode}
+${gmXhrCode}${gmSlackUserIdCode}
   const executeScript = () => {
     try {
 ${requireBlock}${indentedSource}
@@ -602,7 +664,7 @@ ${requireBlock}${indentedSource}
   const run = () => {
     try {
       ensureAddStyle();
-${ensureXhrCall}
+${ensureXhrCall}${ensureSlackUserIdCall}
       const runAt = ${JSON.stringify(script.runAt || "document_idle")};
       
       if (runAt === 'document_start') {
@@ -1076,6 +1138,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // Handle slackUserId from bridge content script
+  if (message.type === "openTamper:slackUserId") {
+    handleSlackUserId(message, sender, sendResponse);
+    return true;
+  }
+
   if (message.type !== "openTamper:runScriptsForTab") {
     return;
   }
@@ -1244,6 +1312,104 @@ async function handleGmXmlHttpRequest(message, sender, sendResponse) {
       isTimeout,
       errorMessage: error.message || String(error),
     });
+  }
+}
+
+/**
+ * Handle slackUserId requests: find an open Slack tab, execute a script in its
+ * MAIN world to read the reduxPersistence IndexedDB, and extract the user ID
+ * from a key matching persist:slack-client-<org>-<user>.
+ */
+async function handleSlackUserId(message, sender, sendResponse) {
+  const { org, scriptId } = message;
+
+  if (!org || typeof org !== "string") {
+    sendResponse?.({ error: true, errorMessage: "Missing or invalid org parameter" });
+    return;
+  }
+
+  if (scriptId) {
+    try {
+      const scripts = await loadScriptsFromStorage();
+      const script = scripts.find((s) => s && s.id === scriptId);
+      if (!script) {
+        sendResponse?.({ error: true, errorMessage: "Unknown script" });
+        return;
+      }
+      const grants = Array.isArray(script.grants) ? script.grants : [];
+      if (!grants.includes("GM_slackUserId")) {
+        sendResponse?.({ error: true, errorMessage: "Script does not have GM_slackUserId grant" });
+        return;
+      }
+    } catch (error) {
+      console.warn("[OpenTamper] Failed to validate slackUserId grant", error);
+    }
+  }
+
+  try {
+    const tabs = await chrome.tabs.query({ url: "https://app.slack.com/*" });
+    if (!tabs || tabs.length === 0) {
+      sendResponse?.({ error: true, errorMessage: "No open Slack tab found. Open app.slack.com first." });
+      return;
+    }
+
+    const tabId = tabs[0].id;
+    const keyPrefix = `persist:slack-client-${org}-`;
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (prefix) => {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open("reduxPersistence");
+          request.onerror = () => reject(new Error("Failed to open reduxPersistence DB"));
+          request.onsuccess = () => {
+            const db = request.result;
+            let tx;
+            try {
+              tx = db.transaction("reduxPersistenceStore", "readonly");
+            } catch (e) {
+              db.close();
+              reject(new Error("Table reduxPersistenceStore not found"));
+              return;
+            }
+            const store = tx.objectStore("reduxPersistenceStore");
+            const cursorReq = store.openCursor();
+            cursorReq.onsuccess = () => {
+              const cursor = cursorReq.result;
+              if (!cursor) {
+                db.close();
+                resolve(null);
+                return;
+              }
+              const key = typeof cursor.key === "string" ? cursor.key : String(cursor.key);
+              if (key.startsWith(prefix)) {
+                const userId = key.slice(prefix.length);
+                db.close();
+                resolve(userId);
+                return;
+              }
+              cursor.continue();
+            };
+            cursorReq.onerror = () => {
+              db.close();
+              reject(new Error("Cursor error reading reduxPersistenceStore"));
+            };
+          };
+        });
+      },
+      args: [keyPrefix],
+    });
+
+    const result = results?.[0]?.result;
+    if (result === null || result === undefined) {
+      sendResponse?.({ error: true, errorMessage: `No key matching persist:slack-client-${org}-* found` });
+      return;
+    }
+
+    sendResponse?.({ userId: result });
+  } catch (error) {
+    sendResponse?.({ error: true, errorMessage: error.message || String(error) });
   }
 }
 
