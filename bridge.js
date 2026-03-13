@@ -4,7 +4,7 @@
  */
 
 const XHR_CHANNEL = "openTamper:gmXhr";
-const SLACK_CHANNEL = "openTamper:slackUserId";
+const SLACK_CHANNEL = "openTamper:gmSlackUserId";
 
 function relayToBackground(channel, event) {
   const { id, type, scriptId } = event.data;

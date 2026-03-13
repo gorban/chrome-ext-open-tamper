@@ -557,28 +557,36 @@ function wrapScriptCode(script) {
       return;
     }
 
-    const SLACK_CHANNEL = "openTamper:slackUserId";
+    const SLACK_CHANNEL = "openTamper:gmSlackUserId";
     const SCRIPT_ID = ${JSON.stringify(script.id)};
+    const TIMEOUT_MS = 30000;
     const pendingRequests = new Map();
     let requestIdCounter = 0;
 
     window.addEventListener("message", (event) => {
       if (event.source !== window) return;
       if (!event.data || event.data.channel !== SLACK_CHANNEL) return;
+      if (event.data.type === "bridge-ready") return;
 
       const { id, type, response, error } = event.data;
       const pending = pendingRequests.get(id);
       if (!pending) return;
+
+      clearTimeout(pending.timer);
       pendingRequests.delete(id);
 
       if (type === "response") {
-        if (response.error) {
-          pending.reject(new Error(response.errorMessage));
+        if (response && response.error) {
+          const err = new Error(response.errorMessage || "GM_slackUserId failed");
+          console.warn("[OpenTamper] GM_slackUserId error:", err.message);
+          pending.reject(err);
         } else {
           pending.resolve(response.userId);
         }
       } else if (type === "error") {
-        pending.reject(new Error(error));
+        const err = new Error(error || "GM_slackUserId bridge error");
+        console.warn("[OpenTamper] GM_slackUserId error:", err.message);
+        pending.reject(err);
       }
     });
 
@@ -588,7 +596,13 @@ function wrapScriptCode(script) {
       }
       return new Promise((resolve, reject) => {
         const requestId = SCRIPT_ID + "_slack_" + (++requestIdCounter);
-        pendingRequests.set(requestId, { resolve, reject });
+        const timer = setTimeout(() => {
+          pendingRequests.delete(requestId);
+          const err = new Error("GM_slackUserId timed out after " + TIMEOUT_MS + "ms");
+          console.warn("[OpenTamper]", err.message);
+          reject(err);
+        }, TIMEOUT_MS);
+        pendingRequests.set(requestId, { resolve, reject, timer });
         window.postMessage({
           channel: SLACK_CHANNEL,
           id: requestId,
@@ -1139,7 +1153,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // Handle slackUserId from bridge content script
-  if (message.type === "openTamper:slackUserId") {
+  if (message.type === "openTamper:gmSlackUserId") {
     handleSlackUserId(message, sender, sendResponse);
     return true;
   }
@@ -1347,59 +1361,86 @@ async function handleSlackUserId(message, sender, sendResponse) {
   }
 
   try {
-    const tabs = await chrome.tabs.query({ url: "https://app.slack.com/*" });
+    let tabs = await chrome.tabs.query({ url: "https://app.slack.com/*" });
+    let createdTab = null;
+
     if (!tabs || tabs.length === 0) {
-      sendResponse?.({ error: true, errorMessage: "No open Slack tab found. Open app.slack.com first." });
-      return;
+      createdTab = await chrome.tabs.create({
+        url: "https://app.slack.com/",
+        active: false,
+      });
+      // Wait for the tab to finish loading so IndexedDB is accessible
+      await new Promise((resolve) => {
+        const listener = (tabId, info) => {
+          if (tabId === createdTab.id && info.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        // Safety timeout so we don't hang forever
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 15000);
+      });
+      tabs = [createdTab];
     }
 
     const tabId = tabs[0].id;
     const keyPrefix = `persist:slack-client-${org}-`;
 
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: (prefix) => {
-        return new Promise((resolve, reject) => {
-          const request = indexedDB.open("reduxPersistence");
-          request.onerror = () => reject(new Error("Failed to open reduxPersistence DB"));
-          request.onsuccess = () => {
-            const db = request.result;
-            let tx;
-            try {
-              tx = db.transaction("reduxPersistenceStore", "readonly");
-            } catch (e) {
-              db.close();
-              reject(new Error("Table reduxPersistenceStore not found"));
-              return;
-            }
-            const store = tx.objectStore("reduxPersistenceStore");
-            const cursorReq = store.openCursor();
-            cursorReq.onsuccess = () => {
-              const cursor = cursorReq.result;
-              if (!cursor) {
+    let results;
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (prefix) => {
+          return new Promise((resolve, reject) => {
+            const request = indexedDB.open("reduxPersistence");
+            request.onerror = () => reject(new Error("Failed to open reduxPersistence DB"));
+            request.onsuccess = () => {
+              const db = request.result;
+              let tx;
+              try {
+                tx = db.transaction("reduxPersistenceStore", "readonly");
+              } catch (e) {
                 db.close();
-                resolve(null);
+                reject(new Error("Table reduxPersistenceStore not found"));
                 return;
               }
-              const key = typeof cursor.key === "string" ? cursor.key : String(cursor.key);
-              if (key.startsWith(prefix)) {
-                const userId = key.slice(prefix.length);
+              const store = tx.objectStore("reduxPersistenceStore");
+              const cursorReq = store.openCursor();
+              cursorReq.onsuccess = () => {
+                const cursor = cursorReq.result;
+                if (!cursor) {
+                  db.close();
+                  resolve(null);
+                  return;
+                }
+                const key = typeof cursor.key === "string" ? cursor.key : String(cursor.key);
+                if (key.startsWith(prefix)) {
+                  const userId = key.slice(prefix.length);
+                  db.close();
+                  resolve(userId);
+                  return;
+                }
+                cursor.continue();
+              };
+              cursorReq.onerror = () => {
                 db.close();
-                resolve(userId);
-                return;
-              }
-              cursor.continue();
+                reject(new Error("Cursor error reading reduxPersistenceStore"));
+              };
             };
-            cursorReq.onerror = () => {
-              db.close();
-              reject(new Error("Cursor error reading reduxPersistenceStore"));
-            };
-          };
-        });
-      },
-      args: [keyPrefix],
-    });
+          });
+        },
+        args: [keyPrefix],
+      });
+    } finally {
+      if (createdTab) {
+        chrome.tabs.remove(createdTab.id).catch(() => {});
+      }
+    }
 
     const result = results?.[0]?.result;
     if (result === null || result === undefined) {
